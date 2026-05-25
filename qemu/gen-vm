@@ -64,7 +64,7 @@ RELEASE=${RELEASE:-noble}
 ARCH=${ARCH:-amd64}
 VCPUS=${VCPUS:-2}
 VMEM=${VMEM:-4096}
-SSH_KEY_FILE=${SSH_KEY_FILE:-$HOME/.ssh/id_rsa.pub}
+SSH_KEY_FILE=${SSH_KEY_FILE:-$HOME/.ssh/id_ed25519.pub}
 USERNAME=${USERNAME:-ubuntu}
 USER_ID=${USER_ID:-1000}
 PASS=${PASS:-password}
@@ -464,6 +464,8 @@ power_state:
   condition: true
 timezone:
   America/Edmonton
+mounts:
+  - [ hostfs, /home/${USERNAME}/code, 9p, "trans=virtio,version=9p2000.L,nofail,_netdev", "0", "0" ]
 write_files:
   - path: /etc/sysctl.d/10-kernel-hardening.conf
     content: 'kernel.dmesg_restrict = 0'

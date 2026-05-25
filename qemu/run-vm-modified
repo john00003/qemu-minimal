@@ -1,0 +1,564 @@
+#!/bin/bash
+#
+# run-vm
+#
+# (C) Stephen Bates <sbates@raithlin>
+#
+# A simple script to run a VM that was (probably) generated using the
+# gen-vm script. Note that to pass in a host filesystem you need to
+# run something like the following (in the guest):
+#
+# sudo mount -t 9p -o trans=virtio,version=9p2000.L hostfs \
+#   /home/batesste/Projects
+#
+# For some reason -t virtfs does not work when running qemu directly
+# but it does work when running via libvirt. Go figure! You can also
+# add this to /etc/fstab in the guest for a permanent solution.
+#
+# hostfs /home/batesste/Projects 9p trans=virtio,version=9p2000.L,nofail 0 1
+#
+# Change NVME in order to add emulated NVMe SSD(s) to the VM.
+# There are three modes for this:
+#   1. If you specify an unsigned number the script checks to
+#      see if image file(s) exist and then creates that many
+#      emulated NVMe SSDs. Performance-related options (such as
+#      io_uring AIO and NVMe device properties like ioeventfd/dbcs)
+#      are auto-probed from the QEMU binary at startup so
+#      the script works across different QEMU versions.
+#   2. If you specify a string then we use this literally as
+#      the argument string given at the command line.
+#   3. If you specify a negative number we implement a simple
+#      null_blk backed NVMe drive. You can insert N null_blk
+#      devices into the kernel of the host using a command
+#      like:
+#        sudo modprobe null_blk nr_devices=8 \
+#          queue_mode=2 gb=1024
+#
+# Note you can pass in multiple PCIe devices from the host using
+# PCI_HOSTDEV where it is equal to the host PCI bus addresses separated
+# by commas. The devices must be unbound from their native host driver
+# and assigned to vfio-pci. Note that in order to ensure PCIe atomics are 
+# supported inside the VM we put each PCI_HOSTDEV device below a pcie-root-port
+# device.
+#
+# NVME_TRACE enables tracing of NVMe device operations. Options are:
+#   - "doorbell": Trace submission/completion queue doorbell writes
+#   - "all": Trace all NVMe events
+#   - Custom trace event name (e.g., "pci_nvme_read")
+# Use NVME_TRACE_FILE to redirect trace output to a file instead of
+# stderr.
+#
+# NVME_LBAF_MASK controls which LBA formats the emulated NVMe namespaces
+# report as supported. When set to a non-"none" value, it is passed to
+# QEMU's nvme-ns LBA format mask property so that only the selected LBA
+# formats appear in the namespace Identify data. The value must be a 16-bit 
+# hexadecimal bitmask (e.g. 0x1–0xFFFF) where bit N enables LBA format N. This
+#is not supported in all QEMU versions, so we detect support at runtime and 
+# only apply the mask if the QEMU binary accepts the corresponding nvme-ns
+# property.
+#
+# NVME_RECREATE when set to "true" deletes and recreates the qcow2 backing
+# files for emulated NVMe SSDs before starting the VM. Default is "false".
+# Only applies when NVME is a positive number (mode 1); no effect for string
+# or null_blk modes.
+#
+# Post 10.1.0 versions of QEMU have libvfio-user support which allows
+# us to create emulated PCIe devices via a socket and the API provided
+# by that library. You can specify these device(s) via a comma-separated
+# list of sockets in VFIO_USERDEV. Each device is placed below its own
+# pcie-root-port to enable hot-plug and PCIe topology isolation.
+#
+# QMP_SOCKET enables the QEMU Machine Protocol monitor socket:
+#   - "false" (default): no QMP socket
+#   - "true": adds a QMP unix socket at
+#     /tmp/qmp-${VM_NAME}-${SSH_PORT}.sock
+#   - Any other value is treated as a custom socket path
+#
+# QGA_SOCKET_PATH controls the host-side UNIX socket path for the
+# QEMU Guest Agent channel. By default, this is:
+#   /tmp/qga-${VM_NAME}-${SSH_PORT}.sock
+#
+# DATA_NIC_QUEUES adds a second multi-queue virtio-net NIC backed
+# by a TAP device (named dt<SSH_PORT>, e.g. dt2231).  This is
+# useful when a guest application (e.g. Weka DPDK) needs to take
+# over a NIC without disrupting the management/SSH NIC.  Set to
+# the number of queues required (e.g. 6 for six Weka containers).
+# Requires sudo for TAP creation; the device is torn down on exit.
+#
+# DRY_RUN when set to anything other than "none" causes the
+# script to print the full QEMU command line to stdout instead
+# of executing it.  Useful for debugging invocation arguments.
+#
+# MCAST_GROUP adds a second virtio-net NIC connected to a QEMU
+# UDP multicast socket (e.g. MCAST_GROUP=230.0.0.1:1234).
+# This lets multiple VMs on the same host (or across hosts on
+# the same LAN) communicate over a shared multicast segment
+# without any TAP/bridge setup.  A deterministic MAC address
+# is derived from SSH_PORT so each VM gets a unique address.
+#
+# BACKING_SHARED when set to "true" adds file.locking=off
+# and backing.file.locking=off to the root disk -drive
+# option. The first disables QEMU's OFD image locking on
+# the overlay; the second disables it on the backing file
+# that QEMU opens internally. Both are needed so that
+# multiple VMs can open overlays that share the same
+# read-only backing file without lock conflicts. Each VM
+# must still have its own overlay (different VM_NAME).
+# Use gen-vm with BACKING_FILE to create per-VM overlays
+# from a shared backing image.
+
+set -e
+
+QEMU_PATH=${QEMU_PATH:-~/code/qemu-mmio-bridge/build/}
+VM_NAME=${VM_NAME:-qemu-minimal}
+ARCH=${ARCH:-amd64}
+VCPUS=${VCPUS:-2}
+VMEM=${VMEM:-4096}
+FILESYSTEM=${FILESYSTEM:-${HOME}/code}
+IMAGES=${IMAGES:-../images}
+SSH_PORT=${SSH_PORT:-2222}
+KVM=${KVM:-enable}
+NVME=${NVME:-2}
+NVME_TRACE=${NVME_TRACE:-none}
+NVME_TRACE_FILE=${NVME_TRACE_FILE:-}
+NVME_LBAF_MASK=${NVME_LBAF_MASK:-none}
+NVME_RECREATE=${NVME_RECREATE:-false}
+PCI_TESTDEV=${PCI_TESTDEV:-none}
+PCI_HOSTDEV=${PCI_HOSTDEV:-none}
+PCI_SWITCH=${PCI_SWITCH:-disable}
+VFIO_USERDEV=${VFIO_USERDEV:-none}
+NVME_SIZE=1024G
+PCI_MMIO_BRIDGE=${PCI_MMIO_BRIDGE:-enable}
+DATA_NIC_QUEUES=${DATA_NIC_QUEUES:-0}
+DRY_RUN=${DRY_RUN:-none}
+MCAST_GROUP=${MCAST_GROUP:-none}
+QMP_SOCKET=${QMP_SOCKET:-false}
+BACKING_SHARED=${BACKING_SHARED:-false}
+QGA_SOCKET_PATH=${QGA_SOCKET_PATH:-/tmp/qga-${VM_NAME}-${SSH_PORT}.sock}
+UEFI=${UEFI:-disable}
+IOMMU=${IOMMU:-disable}
+OVMF_CODE=${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}
+OVMF_VARS_TEMPLATE=${OVMF_VARS_TEMPLATE:-/usr/share/OVMF/OVMF_VARS_4M.fd}
+
+if [ "${UEFI}" = "enable" ]; then
+    OVMF_VARS_VM="${IMAGES}/${VM_NAME}-OVMF_VARS.fd"
+    if [ ! -f "${OVMF_VARS_VM}" ]; then
+        cp "${OVMF_VARS_TEMPLATE}" "${OVMF_VARS_VM}"
+    fi
+    UEFI_ARGS=(
+        -drive "if=pflash,format=raw,readonly=on,file=${OVMF_CODE}"
+        -drive "if=pflash,format=raw,file=${OVMF_VARS_VM}"
+    )
+else
+    UEFI_ARGS=()
+fi
+
+if [ "${KVM}" = "enable" ]; then
+    KVM=",accel=kvm"
+else
+    KVM=""
+fi
+
+if [ "${FILESYSTEM}" = "none" ]; then
+    FILESYSTEM_ARGS=""
+else
+    FILESYSTEM_ARGS="-object memory-backend-memfd,id=mem0,size=2G -virtfs "
+    FILESYSTEM_ARGS+="local,path=${FILESYSTEM},security_model=passthrough,"
+    FILESYSTEM_ARGS+="mount_tag=hostfs "
+fi
+
+if [ "${ARCH}" = "amd64" ]; then
+    QARCH="x86_64"
+    # When IOMMU=enable, expose an Intel VT-d vIOMMU to the guest. Required
+    # for any DMA crossing devices in the guest (e.g. GPU↔NVMe peer access
+    # via rocm-xio). intel-iommu needs split irqchip for interrupt remapping;
+    # caching-mode=on is required for vfio-pci passed-through devices to
+    # function behind the vIOMMU. The -device intel-iommu line must come
+    # before any -device that should sit behind it (added below in QEMU_CMD).
+    if [ "${IOMMU}" = "enable" ]; then
+        QARCH_ARGS="-machine q35${KVM},kernel-irqchip=split -cpu EPYC"
+    else
+        QARCH_ARGS="-machine q35${KVM} -cpu EPYC"
+    fi
+elif [ "${ARCH}" = "arm64" ]; then
+    QARCH="aarch64"
+    QARCH_ARGS="-machine virt,gic-version=max${KVM} -cpu max -bios "
+    QARCH_ARGS+="/usr/share/qemu-efi-aarch64/QEMU_EFI.fd"
+elif [ "${ARCH}" = "riscv64" ]; then
+    QARCH="riscv64"
+    QARCH_ARGS="-machine virt,${KVM} -kernel "
+    QARCH_ARGS+="/usr/lib/u-boot/qemu-riscv64_smode/uboot.elf"
+else
+    echo "Error: No ARCH mapping exists for ${ARCH}! Exiting."
+    exit 1
+fi
+
+function qemu_probe_caps {
+    local qemu="${QEMU_PATH}qemu-system-${QARCH}"
+    QEMU_HAS_IOEVENTFD=0
+    QEMU_HAS_DBCS=0
+    QEMU_AIO="native"
+    QEMU_HAS_LBAF_MASK=0
+    QEMU_HAS_PCI_MMIO_BRIDGE=0
+    QEMU_CAPS_PROBED=1
+    if ! command -v "${qemu}" &>/dev/null; then
+        if [ "${DRY_RUN}" = "none" ]; then
+            echo "Error: QEMU binary '${qemu}'" \
+                "not found." >&2
+            echo "Set QEMU_PATH to the directory" \
+                "containing the qemu-system" \
+                "binary." >&2
+            exit 1
+        fi
+        QEMU_AIO="threads"
+        QEMU_CAPS_PROBED=0
+        return 0
+    fi
+    "${qemu}" -device help 2>&1 \
+        | grep -q 'name "pci-mmio-bridge"' \
+        && QEMU_HAS_PCI_MMIO_BRIDGE=1
+    local nvme_help
+    nvme_help=$("${qemu}" -device nvme,help 2>&1) || true
+    echo "${nvme_help}" | grep -q "ioeventfd=" \
+        && QEMU_HAS_IOEVENTFD=1
+    echo "${nvme_help}" | grep -q "dbcs=" \
+        && QEMU_HAS_DBCS=1
+    if echo quit | timeout 2 "${qemu}" \
+           -machine none -monitor stdio \
+           -drive driver=null-co,if=none,id=t \
+           -drive driver=null-co,if=none,id=u,aio=io_uring \
+           >/dev/null 2>&1; then
+        QEMU_AIO="io_uring"
+    fi
+    local nvme_ns_help
+    nvme_ns_help=$("${qemu}" -device nvme-ns,help 2>&1) || true
+    echo "${nvme_ns_help}" | grep -q "lbaf-mask=" \
+        && QEMU_HAS_LBAF_MASK=1
+    return 0
+}
+
+qemu_probe_caps
+
+function nvme_create {
+    if [ "${NVME_RECREATE}" = "true" ] && [ -f "${IMAGES}/${1}.qcow2" ]; then
+        rm -f "${IMAGES}/${1}.qcow2"
+    fi
+    if [ ! -f "${IMAGES}/${1}.qcow2" ]; then
+        qemu-img create -f qcow2 \
+            "${IMAGES}/${1}.qcow2" $2 >> /dev/null
+    fi
+    local drv="-drive file=${IMAGES}/${1}.qcow2"
+    drv+=",format=qcow2,if=none,id=nvme-${3}"
+    drv+=",aio=${QEMU_AIO},cache.direct=on"
+    drv+=",discard=unmap,detect-zeroes=unmap"
+    # Place the emulated NVMe controller behind its own pcie-root-port so its
+    # BAR sits inside that bridge's small window instead of being assigned to
+    # the start of the q35 64-bit MMIO hole. When the NVMe BAR lands at the
+    # bottom of the hole, OVMF has to push a passed-through GPU's bridge
+    # window past the bottom too, which then can't satisfy the GPU's BAR0
+    # natural-alignment requirement (16 GiB on Navi 21) and resize-BAR fails
+    # with -EBUSY ("Problem resizing BAR0 (-16)"). Use a chassis-id offset
+    # well above PCI_HOSTDEV's 1..N range to avoid collisions.
+    local rp_id="pcie-nvme.${3}"
+    local rp="-device pcie-root-port,id=${rp_id},chassis=$((100 + ${3}))"
+    # NVMe SN field is 20 bytes. The qcow2 filename can stay long, but the
+    # device serial must fit so each device gets a unique /dev/disk/by-id/
+    # link in the guest. Truncate VM_NAME to make room for "-nvme${i}" and
+    # always include the index so multi-device setups don't collide on the
+    # truncated suffix (e.g. "rocm-passthrough-nvme1" and "...-nvme2" both
+    # truncate to "rocm-passthrough-nvm" without this).
+    local serial_suffix="-nvme${3}"
+    local serial_prefix_max=$((20 - ${#serial_suffix}))
+    local serial="${VM_NAME:0:${serial_prefix_max}}${serial_suffix}"
+    local dev="-device nvme,serial=${serial},id=nvme-${3}-dev,bus=${rp_id}"
+    if [ "${PCI_MMIO_BRIDGE}" != "none" ]; then
+        [ ${QEMU_HAS_IOEVENTFD} -eq 1 ] \
+            && dev+=",ioeventfd=off"
+        [ ${QEMU_HAS_DBCS} -eq 1 ] \
+            && dev+=",dbcs=off"
+    fi
+    local ns="-device nvme-ns,drive=nvme-${3},bus=nvme-${3}-dev,nsid=1"
+    if [ "${NVME_LBAF_MASK}" != "none" ]; then
+        if [[ ! ${NVME_LBAF_MASK} =~ ^0x[0-9a-fA-F]{1,4}$ ]]; then
+            echo "Error: NVME_LBAF_MASK ('${NVME_LBAF_MASK}') must be a 16-bit hex mask" >&2
+            exit 1
+        fi
+        NVME_LBAF_MASK=$(echo "${NVME_LBAF_MASK}" | tr 'A-F' 'a-f')
+        if [ ${QEMU_HAS_LBAF_MASK} -eq 1 ]; then
+            ns+=",lbaf-mask=${NVME_LBAF_MASK}"
+        fi
+    fi
+    echo "${rp} ${drv} ${dev} ${ns} "
+}
+
+  # Check that the user has provided valid PCIe bus addresses and also check
+  # that the devices associated with these addresses are bound to vfio-pci
+function pci_check () {
+    if [[ ! ${1} =~ ^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9]$ ]]; then
+        echo "ERROR: PCIe bus address is invalid (${1})."
+        exit 1
+    fi
+
+    if ! lspci -k -s "${1}" | grep -q "vfio-pci"; then
+        echo "ERROR: Device ${1} is not bound to vfio-pci driver."
+        exit 1
+    fi
+}
+
+# Setup NVMe tracing if requested
+TRACE_ARGS=""
+if [ "${NVME_TRACE}" != "none" ]; then
+    if [ "${NVME_TRACE}" = "doorbell" ]; then
+        TRACE_ARGS="-trace enable=pci_nvme_mmio_doorbell_sq "
+        TRACE_ARGS+="-trace enable=pci_nvme_mmio_doorbell_cq "
+    elif [ "${NVME_TRACE}" = "all" ]; then
+        TRACE_ARGS="-trace enable=pci_nvme* "
+    else
+        TRACE_ARGS="-trace enable=${NVME_TRACE} "
+    fi
+
+    if [ -n "${NVME_TRACE_FILE}" ]; then
+        TRACE_ARGS+="-trace file=${NVME_TRACE_FILE} "
+    fi
+fi
+
+if [ "${NVME}" = "none" ]; then
+    NVME_ARGS=""
+elif [[ ${NVME} =~ ^[0-9]+$ ]]; then
+    NVME_ARGS=""
+    for i in $(seq 1 ${NVME}); do
+        NVME_NAME=${VM_NAME}-nvme${i}
+        NVME_ARGS+=$(nvme_create ${NVME_NAME} ${NVME_SIZE} ${i})
+    done
+elif [[ ${NVME} =~ ^-[0-9]+$ ]]; then
+    NVME_ARGS=""
+    for i in $(seq 0 $(( -(${NVME}) - 1 ))); do
+        NVME_NAME=${VM_NAME}-nvme${i}
+        NVME_ARGS+=" -drive file=/dev/nullb${i},format=raw,if=none,id=nvme-${i} -device nvme,serial=${NVME_NAME},drive=nvme-${i}"
+    done
+else
+    NVME_ARGS=${NVME}
+fi
+
+if [ "${PCI_TESTDEV}" = "none" ]; then
+    PCI_TESTDEV_ARGS=""
+else
+    PCI_TESTDEV_ARGS="-device pci-testdev,membar=16G,membar-backed=true"
+fi
+
+if [ "${PCI_HOSTDEV}" = "none" ]; then
+    PCI_HOSTDEV_ARGS=""
+elif [ "${PCI_SWITCH}" = "enable" ]; then
+    # Put all PCI_HOSTDEV entries behind a single TI X3130 PCIe switch.
+    # Real PCIe switches route peer transactions between their downstream
+    # ports internally, so GPU↔NVMe peer DMA / MMIO that would be unrouted
+    # by q35's pcie.0 root complex (which doesn't route between separate
+    # root ports) can traverse the switch fabric instead. This is what
+    # rocm-xio's device-memory tests need (NVMe controller DMAing from
+    # GPU VRAM).
+    #
+    # Topology:
+    #   pcie.0 -> pcie-root-port(chassis=200)
+    #             -> x3130-upstream
+    #                -> xio3130-downstream(chassis=201,slot=1) -> vfio-pci #1
+    #                -> xio3130-downstream(chassis=202,slot=2) -> vfio-pci #2
+    #                -> ...
+    #
+    # Chassis IDs use a 200+ offset so they stay clear of pcie-nvme.* (100+)
+    # and the non-switch pcie.* range (1..N).
+    #
+    # Bump the q35 64-bit MMIO hole to 64 GiB: the switch nests another
+    # bridge between the GPU and the root, and the upstream port window
+    # has to be a single power-of-2-aligned region containing every
+    # downstream port window. With Navi 21's 16 GiB BAR0 + alignment slack,
+    # the default 32 GiB hole is tight; 64 GiB gives comfortable headroom
+    # without changing baseline behavior (only applied with PCI_SWITCH).
+    PCI_HOSTDEV_ARGS="-global q35-pcihost.pci-hole64-size=64G "
+    PCI_HOSTDEV_ARGS+="-device pcie-root-port,id=pcie-switch-rp,chassis=200 "
+    PCI_HOSTDEV_ARGS+="-device x3130-upstream,id=pcie-switch-up,bus=pcie-switch-rp "
+    i=0
+    for THIS_PCI_HOSTDEV in ${PCI_HOSTDEV//,/ }; do
+        i=$((i + 1))
+        pci_check "${THIS_PCI_HOSTDEV}"
+        PCI_HOSTDEV_ARGS+="-device xio3130-downstream,id=pcie-switch-down${i}"
+        PCI_HOSTDEV_ARGS+=",bus=pcie-switch-up,chassis=$((200 + i)),slot=${i} "
+        PCI_HOSTDEV_ARGS+="-device vfio-pci,bus=pcie-switch-down${i}"
+        PCI_HOSTDEV_ARGS+=",host=${THIS_PCI_HOSTDEV},x-no-kvm-intx=on "
+    done
+else
+    i=0
+    for THIS_PCI_HOSTDEV in ${PCI_HOSTDEV//,/ }; do
+        i=$((i + 1))
+        pci_check "${THIS_PCI_HOSTDEV}"
+        PCI_HOSTDEV_ARGS+="-device pcie-root-port,id=pcie.${i},chassis=${i} "
+        PCI_HOSTDEV_ARGS+="-device vfio-pci,bus=pcie.${i},host=${THIS_PCI_HOSTDEV},x-no-kvm-intx=on "
+    done
+fi
+
+if [ "${VFIO_USERDEV}" = "none" ]; then
+    VFIO_USERDEV_ARGS=()
+else
+    VFIO_USERDEV_ARGS+=( -object \
+        memory-backend-memfd,id=mem-vfio-user,size=${VMEM}M,share=on )
+    VFIO_USERDEV_ARGS+=( -numa node,memdev=mem-vfio-user )
+    j=0
+    for THIS_VFIO_USERDEV in ${VFIO_USERDEV//,/ }; do
+        if [ "${DRY_RUN}" = "none" ] \
+                && [ ! -S "${THIS_VFIO_USERDEV}" ]; then
+            echo "ERROR: Socket ${THIS_VFIO_USERDEV}" \
+                "does not exist."
+            exit 1
+        fi
+        j=$((j + 1))
+        VFIO_USERDEV_ARGS+=( \
+            -device "pcie-root-port,id=pcie-vfu.${j}" )
+        DEV_JSON=$(printf \
+            '{"driver":"vfio-user-pci","bus":"pcie-vfu.%d","socket":{"path":"%s","type":"unix"}}' \
+            "${j}" "${THIS_VFIO_USERDEV}")
+        VFIO_USERDEV_ARGS+=( -device "${DEV_JSON}" )
+    done
+fi
+
+if [ "${PCI_MMIO_BRIDGE}" = "none" ]; then
+    PCI_MMIO_BRIDGE_ARGS=()
+else
+    if [ ${QEMU_HAS_PCI_MMIO_BRIDGE} -eq 0 ]; then
+        QEMU_BIN="${QEMU_PATH}qemu-system-${QARCH}"
+        if [ ${QEMU_CAPS_PROBED} -eq 0 ]; then
+            echo "Error: PCI_MMIO_BRIDGE requested, but '${QEMU_BIN}'" \
+                "was not found in DRY_RUN mode, so bridge support" \
+                "could not be probed." >&2
+            echo "Set QEMU_PATH to a compatible QEMU build, or run" \
+                "without DRY_RUN so missing binaries fail earlier." >&2
+        else
+            echo "Error: PCI_MMIO_BRIDGE requested, but '${QEMU_BIN}'" \
+                "does not support 'pci-mmio-bridge'." >&2
+            echo "Run '${QEMU_BIN} -device help' to list devices and" \
+                "set QEMU_PATH to a compatible QEMU build." >&2
+        fi
+        exit 1
+    fi
+    echo "NOTE: PCI_MMIO_BRIDGE active; nvme_create forces ioeventfd=off,dbcs=off."
+    # poll-interval-ns is the bridge timer interval. With the default 1ms,
+    # there's a race between the GPU enqueueing the last doorbell + xio-tester
+    # running DELETE_SQ vs the bridge replaying that doorbell. If the bridge
+    # poll lands AFTER DELETE_SQ, the late MMIO write hits a half-freed queue
+    # and the controller wedges, breaking subsequent kernel I/O on the same
+    # QID (visible as ~30s nvme-cli timeout + controller reset). 10us shrinks
+    # the race window by 100x at the cost of one QEMU thread polling faster.
+    # See genPciMmioBridgeCmd() in rocm-xio (fire-and-forget submission, no
+    # status-poll synchronization) and pci_mmio_bridge_poll() in QEMU.
+    PCI_MMIO_BRIDGE_ARGS=( -device pci-mmio-bridge,id=mmio-bridge,shadow-gpa=0x80000000,shadow-size=8192,poll-interval-ns=10000,addr=8.0 )
+    PCI_MMIO_BRIDGE_ARGS+=( -trace enable=pci_mmio_* )
+fi
+
+DATA_NIC_ARGS=""
+DATA_TAP_CREATED=0
+if [ "${DATA_NIC_QUEUES}" -gt 0 ] 2>/dev/null; then
+    DATA_TAP="dt${SSH_PORT}"
+    if [ "${DRY_RUN}" = "none" ]; then
+        if ! ip link show "${DATA_TAP}" &>/dev/null; then
+            sudo ip tuntap add dev "${DATA_TAP}" \
+                mode tap multi_queue \
+                user "$(whoami)"
+            sudo ip link set "${DATA_TAP}" up
+            DATA_TAP_CREATED=1
+        fi
+        if [ "${DATA_TAP_CREATED}" -eq 1 ]; then
+            trap "sudo ip tuntap del dev ${DATA_TAP} mode tap 2>/dev/null" EXIT
+        fi
+    fi
+    VECTORS=$(( 2 * DATA_NIC_QUEUES + 2 ))
+    DATA_NIC_ARGS="-netdev tap,id=data0"
+    DATA_NIC_ARGS+=",ifname=${DATA_TAP}"
+    DATA_NIC_ARGS+=",queues=${DATA_NIC_QUEUES}"
+    DATA_NIC_ARGS+=",vhost=on"
+    DATA_NIC_ARGS+=",script=no,downscript=no"
+    DATA_NIC_ARGS+=" -device virtio-net-pci"
+    DATA_NIC_ARGS+=",netdev=data0"
+    DATA_NIC_ARGS+=",mq=on"
+    DATA_NIC_ARGS+=",vectors=${VECTORS}"
+fi
+
+MCAST_ARGS=""
+if [ "${MCAST_GROUP}" != "none" ]; then
+    MCAST_MAC=$(printf "52:54:00:00:%02x:%02x" \
+        $(( SSH_PORT / 256 )) $(( SSH_PORT % 256 )))
+    MCAST_ARGS="-netdev socket,id=net1,mcast=${MCAST_GROUP}"
+    MCAST_ARGS+=" -device virtio-net-pci,netdev=net1"
+    MCAST_ARGS+=",mac=${MCAST_MAC}"
+fi
+
+QMP_ARGS=""
+if [ "${QMP_SOCKET}" != "false" ]; then
+    if [ "${QMP_SOCKET}" = "true" ]; then
+        QMP_SOCKET_PATH="/tmp/qmp-${VM_NAME}-${SSH_PORT}.sock"
+    else
+        QMP_SOCKET_PATH="${QMP_SOCKET}"
+    fi
+    QMP_ARGS="-qmp unix:${QMP_SOCKET_PATH},server,nowait"
+fi
+
+QGA_ARGS=(
+    -chardev "socket,path=${QGA_SOCKET_PATH},server=on,wait=off,id=qga0"
+    -device virtio-serial
+    -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0
+)
+
+# Root disk via explicit virtio-blk-pci so we can tune num-queues / queue-size.
+# The implicit `-drive if=virtio` shortcut creates a single-queue virtio-blk
+# with queue-size=256, which gets saturated under heavy concurrent guest I/O
+# (e.g. ctest -j8 in the hipFile suite) and triggers
+# "qemu-system-x86_64: virtio: bogus descriptor or out of resources" plus
+# guest-side hung_task on ext4 writeback.
+# ROOT_DRIVE_NUM_QUEUES=${ROOT_DRIVE_NUM_QUEUES:-${VCPUS}}
+# ROOT_DRIVE_QUEUE_SIZE=${ROOT_DRIVE_QUEUE_SIZE:-1024}
+# ROOT_DRIVE="-drive if=none,id=root,format=qcow2"
+ROOT_DRIVE="-drive if=virtio,id=root,format=qcow2"
+ROOT_DRIVE+=",file=${IMAGES}/${VM_NAME}.qcow2"
+if [ "${BACKING_SHARED}" = "true" ]; then
+    ROOT_DRIVE+=",file.locking=off,backing.file.locking=off"
+fi
+
+# Intel VT-d vIOMMU device (added before NVMe / PCI hostdev so they sit
+# behind it). Requires kernel-irqchip=split (set in QARCH_ARGS above).
+# caching-mode=on is required for vfio-pci passthrough behind the vIOMMU.
+# Guest must boot with `intel_iommu=on iommu=pt` for the kernel to attach.
+IOMMU_ARGS=()
+if [ "${IOMMU}" = "enable" ]; then
+    IOMMU_ARGS=( -device intel-iommu,intremap=on,caching-mode=on )
+fi
+# ROOT_DRIVE+=" -device virtio-blk-pci,drive=root"
+# ROOT_DRIVE+=",num-queues=${ROOT_DRIVE_NUM_QUEUES}"
+# ROOT_DRIVE+=",queue-size=${ROOT_DRIVE_QUEUE_SIZE}"
+
+QEMU_CMD=(${QEMU_PATH}qemu-system-${QARCH}
+   ${QARCH_ARGS}
+   "${UEFI_ARGS[@]}"
+   ${TRACE_ARGS}
+   -smp cpus=${VCPUS}
+   -m ${VMEM}
+   ${FILESYSTEM_ARGS}
+   -echr 20
+   -display none
+   -serial stdio
+   -monitor "unix:/tmp/mon-${VM_NAME}-${SSH_PORT}.sock,server,nowait"
+   "${IOMMU_ARGS[@]}"
+   ${NVME_ARGS}
+   ${PCI_TESTDEV_ARGS}
+   ${PCI_HOSTDEV_ARGS}
+   "${PCI_MMIO_BRIDGE_ARGS[@]}"
+   "${VFIO_USERDEV_ARGS[@]}"
+   ${ROOT_DRIVE}
+   -netdev user,id=net0,hostfwd=tcp::${SSH_PORT}-:22
+   -device virtio-net-pci,netdev=net0
+   ${DATA_NIC_ARGS}
+   ${MCAST_ARGS}
+   ${QMP_ARGS}
+   "${QGA_ARGS[@]}")
+
+if [ "${DRY_RUN}" != "none" ]; then
+    echo "${QEMU_CMD[@]}"
+else
+    "${QEMU_CMD[@]}"
+fi
