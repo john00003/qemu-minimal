@@ -463,7 +463,14 @@ else
     # the race window by 100x at the cost of one QEMU thread polling faster.
     # See genPciMmioBridgeCmd() in rocm-xio (fire-and-forget submission, no
     # status-poll synchronization) and pci_mmio_bridge_poll() in QEMU.
-    PCI_MMIO_BRIDGE_ARGS=( -device pci-mmio-bridge,id=mmio-bridge,shadow-gpa=0x80000000,shadow-size=8192,poll-interval-ns=10000,addr=8.0 )
+    # shadow-gpa must sit outside guest RAM AND outside passthrough BARs.
+    # - 0x80000000 (2 GiB) overlaps low RAM whenever VMEM > 2048.
+    # - 0xC000000000 (768 GiB) collided with the Navi 21 GPU's 16 GiB BAR0
+    #   which OVMF places at its natural-alignment slot starting 0xC000000000.
+    # 0x500000000 (20 GiB) sits just above ~17 GiB of guest RAM (VMEM=15360 +
+    # 2 GiB memfd backend) and well below the GPU BAR. Verify with
+    # 'info mtree' in the QEMU monitor when changing VMEM or passthrough set.
+    PCI_MMIO_BRIDGE_ARGS=( -device pci-mmio-bridge,id=mmio-bridge,shadow-gpa=0x500000000,shadow-size=8192,poll-interval-ns=10000,addr=8.0 )
     PCI_MMIO_BRIDGE_ARGS+=( -trace enable=pci_mmio_* )
 fi
 
