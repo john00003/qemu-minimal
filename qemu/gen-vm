@@ -83,6 +83,8 @@ ANSIBLE_TAGS=${ANSIBLE_TAGS:-}
 ANSIBLE_EXTRA_ARGS=${ANSIBLE_EXTRA_ARGS:-}
 ANSIBLE_USERNAME=${ANSIBLE_USERNAME:-${USERNAME}}
 ANSIBLE_TIMEOUT=${ANSIBLE_TIMEOUT:-600}
+GIT_NAME=${GIT_NAME:-$(git config --global user.name 2>/dev/null)}
+GIT_EMAIL=${GIT_EMAIL:-$(git config --global user.email 2>/dev/null)}
 
   # Focal and above prefers us to use cloud images and
   # cloud-init. Download the focal cloud image and set it up using a
@@ -486,6 +488,21 @@ write_files:
       DefaultTimeoutStopSec=15s
     owner: root:root
     permissions: 0o644
+    defer: true
+  - path: /home/${USERNAME}/.gitconfig
+    content: |
+      [user]
+          name = ${GIT_NAME}
+          email = ${GIT_EMAIL}
+      [core]
+          editor = emacs
+      [pull]
+          rebase = false
+      [init]
+          defaultBranch = main
+    owner: ${USERNAME}:${USERNAME}
+    permissions: 0o644
+    append: false
     defer: true
   - path: /home/${USERNAME}/.emacs
     content: |
