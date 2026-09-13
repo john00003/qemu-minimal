@@ -226,10 +226,35 @@ def _vfio_userdev_args(cfg: VMConfig) -> list[str]:
     for j, sock in enumerate(cfg.vfio_userdev, start=1):
         if not cfg.dry_run and not Path(sock).is_socket():
             sys.exit(f"ERROR: Socket {sock} does not exist.")
-        # No PCIe root port — add the device directly. rombar=0 suppresses
-        # the ROM BAR that vfio-user-pci would otherwise advertise.
+        # Each function gets its own PCIe root port, and the device goes
+        # behind it rather than on pcie.0, because Linux will not let a
+        # device issue PCIe AtomicOps otherwise. Two separate reasons, both
+        # in pci_enable_atomic_ops_to_root():
+        #
+        #   1. A function sitting on pcie.0 enumerates as a Root Complex
+        #      Integrated Endpoint, and PCI_EXP_TYPE_RC_END is no longer an
+        #      accepted requester type.
+        #   2. pcie_find_root_port() must return a port, so one has to exist.
+        #
+        # x-atomic-ops makes that port advertise 32- and 64-bit AtomicOp
+        # completion in DEVCAP2, which the same function requires of the root
+        # port before it will set the endpoint's AtomicOp Requester Enable.
+        # Without all three, amdgpu sets have_atomics_support=false and KFD
+        # refuses the device ("PCI rejects atomics"), which is what the
+        # out-of-tree kfd_device.c patch used to paper over.
+        #
+        # NOTE: x-atomic-ops is not in upstream QEMU. It needs a QEMU built
+        # with the pcie-root-port AtomicOp patch; a stock binary will reject
+        # the property outright rather than silently ignore it.
+        rp_id = f"vfu-rp{j}"
+        args += [
+            "-device",
+            f"pcie-root-port,id={rp_id},chassis={j},slot={j},x-atomic-ops=on",
+        ]
+        # rombar=0 suppresses the ROM BAR that vfio-user-pci would otherwise
+        # advertise.
         dev_json = (
-            f'{{"driver":"vfio-user-pci","rombar":0,'
+            f'{{"driver":"vfio-user-pci","rombar":0,"bus":"{rp_id}",'
             f'"socket":{{"path":"{sock}","type":"unix"}}}}'
         )
         args += ["-device", dev_json]
