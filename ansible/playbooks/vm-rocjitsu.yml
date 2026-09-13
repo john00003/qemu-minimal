@@ -162,48 +162,28 @@
         - gc_12_1_0_mes.bin
         - gc_12_1_0_mes1.bin
 
-    # Patch the amdgpu DKMS source to assume PCIe atomics support when
-    # emu_mode=1 is active. The emulated device cannot advertise atomics
-    # through the vfio-user PCI capability, but KFD requires them to
-    # accept the device.
-    - name: Patch KFD atomics check for emu_mode in DKMS source
-      ansible.builtin.shell:
-        cmd: |
-          python3 - << 'PYEOF'
-          import glob, sys
-          srcs = sorted(glob.glob('/usr/src/amdgpu-*'))
-          if not srcs:
-              print('no amdgpu DKMS source found', file=sys.stderr)
-              sys.exit(1)
-          path = srcs[-1] + '/amd/amdkfd/kfd_device.c'
-          old = 'kfd->pci_atomic_requested = amdgpu_amdkfd_have_atomics_support(kfd->adev);'
-          new = 'kfd->pci_atomic_requested = amdgpu_amdkfd_have_atomics_support(kfd->adev) || (amdgpu_emu_mode == 1);'
-          with open(path) as f:
-              content = f.read()
-          if new in content:
-              print('already patched')
-              sys.exit(0)
-          if old not in content:
-              print(f'target string not found in {path}', file=sys.stderr)
-              sys.exit(1)
-          with open(path, 'w') as f:
-              f.write(content.replace(old, new, 1))
-          print(f'patched {path}')
-          PYEOF
-        executable: /bin/bash
-      become: true
-      register: atomics_patch
-      changed_when: "'patched /' in atomics_patch.stdout"
-
-    - name: Rebuild DKMS amdgpu module after atomics patch
-      ansible.builtin.shell:
-        cmd: |
-          VER=$(dkms status amdgpu | awk -F'[,/]' 'NR==1{gsub(/ /,"",$2); print $2}')
-          dkms build amdgpu/"$VER" -k $(uname -r) --force
-          dkms install amdgpu/"$VER" -k $(uname -r) --force
-        executable: /bin/bash
-      become: true
-      when: atomics_patch.changed
+    # The KFD atomics patch that used to live here is gone, along with the
+    # DKMS rebuild it forced. It rewrote kfd_device.c so pci_atomic_requested
+    # would also accept amdgpu_emu_mode == 1, because the emulated function
+    # could not get PCIe AtomicOps enabled and KFD rejects a device without
+    # them ("PCI rejects atomics").
+    #
+    # That was never a guest problem. Linux enables an AtomicOp requester in
+    # pci_enable_atomic_ops_to_root(), which reads Device Capabilities 2 of
+    # the *root port* above the endpoint, not the endpoint's own completer
+    # bits. The device was attached straight to pcie.0, so it had no root
+    # port at all and enumerated as a Root Complex Integrated Endpoint, which
+    # is no longer an accepted requester type either. rocjitsu was already
+    # advertising AtomicOpsCap: 32bit+ 64bit+ correctly; nothing was ever
+    # going to read it.
+    #
+    # The fix is in the topology: qemu-tool now puts each vfio-user function
+    # behind its own pcie-root-port with x-atomic-ops=on, so the root port
+    # advertises 32- and 64-bit AtomicOp completion. With that in place an
+    # unmodified distro amdgpu gets have_atomics_support=true and KFD accepts
+    # the device, so the guest needs no patch and no DKMS rebuild.
+    #
+    # This requires a QEMU built with the pcie-root-port AtomicOp patch.
 
     - name: Install rocBLAS dev package
       ansible.builtin.package:
