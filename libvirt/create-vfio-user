@@ -1,0 +1,178 @@
+#!/bin/bash
+#
+# create-vfio-user
+#
+# A companion to create-nvme. Generates the libvirt domain XML needed to
+# attach one or more out-of-process PCI functions served over the
+# vfio-user protocol -- for example a rocjitsu emulated gfx1250 GPU, or an
+# ernic RDMA NIC -- to a libvirt-managed VM.
+#
+# This is a POLYFILL, not an end state. libvirt has no native model for a
+# PCI function whose implementation lives in another process, so everything
+# here goes in through the <qemu:commandline> escape hatch. The input
+# contract (the SOCKETS list) is meant to stay stable so that if libvirt
+# ever grows a real element, only this script changes. See
+# libvirt-rfe-draft.md for the argument that it should.
+#
+# Add this to your domain at the top:
+# xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'
+#
+# Usage:
+#   SOCKETS=/run/vfu/rocjitsu-1.sock ./create-vfio-user
+#   SOCKETS=/run/vfu/a.sock,/run/vfu/b.sock START_ADDR=7 ./create-vfio-user
+#
+# libvirt does NOT start the backend. The rocjitsu (or ernic) process must
+# already be running and its socket must already exist before the domain
+# starts, or QEMU exits immediately with "Failed to connect to ...". This
+# mirrors libvirt's externally-launched virtiofs mode, where libvirt takes
+# a <source socket='...'/> and disclaims responsibility for the daemon.
+#
+# --- Traps, in the order you will hit them --------------------------------
+#
+# [1] You cannot write socket=/path in the normal -device key=value form.
+#     The socket property is a QAPI SocketAddress, i.e. an object, and the
+#     key=value parser has no syntax for it. Both of the obvious spellings
+#     fail, with errors that do not suggest the fix:
+#
+#       -device vfio-user-pci,socket=/run/vfu/x.sock
+#         => Invalid parameter type for 'socket', expected: object
+#       -device vfio-user-pci,socket.type=unix,socket.path=/run/vfu/x.sock
+#         => Property 'vfio-user-pci.socket.type' not found
+#
+#     The only form that works is JSON -device, which is what this script
+#     emits. It survives <qemu:arg value='...'/> because the XML attribute
+#     is single-quoted and the JSON uses double quotes.
+#
+# [2] The backend maps guest RAM, so guest memory must be shareable.
+#     Without the <memoryBacking> stanza below, the vfio-user server cannot
+#     map DMA windows and the device is present but never completes
+#     anything. Use source type='memfd' with access mode='shared'; this is
+#     the same stanza virt-install-ubuntu emits for its virtiofs path
+#     (--memorybacking source.type=memfd,access.mode=shared). Note this
+#     applies to the WHOLE domain, not to one device -- see the RFE note,
+#     because "all of guest RAM is mapped by an unconfined external
+#     process" is the open question in this design.
+#
+# [3] AppArmor will block the socket. libvirt's qemu profile does not
+#     permit arbitrary socket paths, and the failure looks like a
+#     connection error rather than a denial. Add the line this script
+#     prints to /etc/apparmor.d/abstractions/libvirt-qemu and restart
+#     libvirtd. Check `dmesg | grep -i apparmor` when in doubt; the same
+#     class of trap create-nvme documents for image files.
+#
+# [4] PCIe slot collisions with libvirt's own address allocator. libvirt
+#     assigns addresses to the devices it knows about, knows nothing about
+#     anything in <qemu:commandline>, and will happily hand out a slot this
+#     script has already used. The symptom is
+#       PCI: slot N function 0 not available for X, in use by Y
+#     START_ADDR exists to move our devices out of the way; raise it until
+#     the collision stops. This is the same workaround, for the same
+#     reason, as create-nvme's START_ADDR.
+#
+# [5] The root port is not optional if the guest needs PCIe atomics.
+#     A vfio-user function placed directly on pcie.0 enumerates as a Root
+#     Complex Integrated Endpoint. Linux's pci_enable_atomic_ops_to_root()
+#     refuses an RCiEP as an AtomicOp requester and also requires
+#     pcie_find_root_port() to succeed, so such a device can never have
+#     AtomicOps enabled. amdgpu then sets have_atomics_support=false and
+#     KFD drops the device with "PCI rejects atomics", so /dev/kfd never
+#     appears. Hence ROOT_PORT=yes by default.
+#
+# [6] x-atomic-ops requires a patched QEMU. The same kernel function reads
+#     Device Capabilities 2 of the root port and demands 32- and 64-bit
+#     AtomicOp completion there. Upstream QEMU's pcie-root-port advertises
+#     neither (DEVCAP2 = 0x00300020) and has no property to turn them on.
+#     With the patch, DEVCAP2 becomes 0x003001a0 and the kernel is
+#     satisfied. A stock QEMU REJECTS the property rather than ignoring it,
+#     so the domain will fail to start with
+#       Property 'pcie-root-port.x-atomic-ops' not found
+#     If you are on a stock QEMU and do not need atomics, set
+#     ATOMIC_OPS=no. Keep ROOT_PORT=yes regardless; it costs nothing and
+#     is closer to how real hardware presents.
+#
+# --- Variables ------------------------------------------------------------
+#
+# SOCKETS     Comma-separated vfio-user socket paths. Required.
+# START_ADDR  First pcie.0 slot to use. Default 6, as create-nvme.
+# ROOT_PORT   yes|no. Put each function behind its own root port. Default yes.
+# ATOMIC_OPS  yes|no. Add x-atomic-ops=on to each root port. Default yes.
+#             Ignored when ROOT_PORT=no, since the property is the port's.
+# CHASSIS     First chassis number. Default 1. Each port needs its own.
+
+set -e
+
+SOCKETS=${SOCKETS:-none}
+START_ADDR=${START_ADDR:-6}
+ROOT_PORT=${ROOT_PORT:-yes}
+ATOMIC_OPS=${ATOMIC_OPS:-yes}
+CHASSIS=${CHASSIS:-1}
+
+if [ "${SOCKETS}" = "none" ]; then
+    echo "SOCKETS is not set. Example:" >&2
+    echo "  SOCKETS=/run/vfu/rocjitsu-1.sock $0" >&2
+    exit 1
+fi
+
+if [ "${ROOT_PORT}" != "yes" ] && [ "${ATOMIC_OPS}" = "yes" ]; then
+    echo "NOTE: ATOMIC_OPS=yes ignored because ROOT_PORT=no." >&2
+    echo "      x-atomic-ops is a property of the root port, and a function" >&2
+    echo "      on pcie.0 cannot use AtomicOps at all. See trap [5]." >&2
+    ATOMIC_OPS=no
+fi
+
+IFS=',' read -r -a SOCKET_LIST <<< "${SOCKETS}"
+
+for sock in "${SOCKET_LIST[@]}"; do
+    if [ ! -S "${sock}" ]; then
+	echo "WARNING: ${sock} is not a socket (yet)." >&2
+	echo "         The backend must be running before the domain starts." >&2
+    fi
+done
+
+if [ "${ATOMIC_OPS}" = "yes" ]; then
+    ATOMIC_ARG=",x-atomic-ops=on"
+else
+    ATOMIC_ARG=""
+fi
+
+echo
+echo "# Add this to your domain entry at the top of the xml:"
+echo "# xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'"
+echo
+echo "# The backend maps guest RAM, so the domain needs shareable memory."
+echo "# Place this as a direct child of <domain>, alongside <memory>."
+echo "  <memoryBacking>"
+echo "    <source type='memfd'/>"
+echo "    <access mode='shared'/>"
+echo "  </memoryBacking>"
+echo
+echo "  <qemu:commandline>"
+
+i=0
+j=${START_ADDR}
+c=${CHASSIS}
+for sock in "${SOCKET_LIST[@]}"; do
+    if [ "${ROOT_PORT}" = "yes" ]; then
+	echo "    <qemu:arg value='-device'/>"
+	echo "    <qemu:arg value='pcie-root-port,id=vfu-rp${i},chassis=${c},slot=${c},addr=${j}${ATOMIC_ARG}'/>"
+	echo "    <qemu:arg value='-device'/>"
+	echo "    <qemu:arg value='{\"driver\":\"vfio-user-pci\",\"rombar\":0,\"bus\":\"vfu-rp${i}\",\"socket\":{\"path\":\"${sock}\",\"type\":\"unix\"}}'/>"
+    else
+	echo "    <qemu:arg value='-device'/>"
+	echo "    <qemu:arg value='{\"driver\":\"vfio-user-pci\",\"rombar\":0,\"addr\":${j},\"socket\":{\"path\":\"${sock}\",\"type\":\"unix\"}}'/>"
+    fi
+    i=$((i + 1))
+    j=$((j + 1))
+    c=$((c + 1))
+done
+
+echo "  </qemu:commandline>"
+echo
+echo "# AppArmor: libvirt's qemu profile does not allow these socket paths."
+echo "# Add the following to /etc/apparmor.d/abstractions/libvirt-qemu and"
+echo "# then: sudo systemctl restart libvirtd"
+for sock in "${SOCKET_LIST[@]}"; do
+    echo "#   \"${sock}\" rw,"
+done
+echo "# A denial shows up as a connection failure, not as a permission"
+echo "# error; check 'dmesg | grep -i apparmor' if the domain will not start."
