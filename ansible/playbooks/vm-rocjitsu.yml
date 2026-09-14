@@ -72,6 +72,22 @@
         - /etc/apt/keyrings/amdrocm.gpg
         - /etc/apt/sources.list.d/rocm.sources
 
+    # The pinned fave_packages re-dearmors this key on every run, so this is
+    # belt and braces rather than the fix -- it is what makes the play recover
+    # on a guest whose keyring was written by an older collection, including
+    # one restored from a base image baked before HashiCorp's 2026-09-09
+    # rotation. Cheap, and the alternative is an apt update that fails with
+    # NO_PUBKEY and names nothing that points back here.
+    - name: Remove stale HashiCorp keyring and apt source
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      become: true
+      loop:
+        - /usr/share/keyrings/hashicorp-archive-keyring.gpg
+        - /etc/apt/keyrings/hashicorp-archive-keyring.asc
+        - /etc/apt/sources.list.d/hashicorp.list
+
     - name: Remove any stale device-metrics-exporter apt sources
       ansible.builtin.shell:
         cmd: |

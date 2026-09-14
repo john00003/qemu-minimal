@@ -1,6 +1,16 @@
 ---
 collections:
-  - name: sbates130272.batesste
-    version: ">=2.4.0"
+  # A fork branch rather than the Galaxy release, for one fix that the whole
+  # playbook depends on. 2.4.0's fave_packages guards its HashiCorp key
+  # dearmor with creates:, so a host that ran the role before HashiCorp's
+  # 2026-09-09 key rotation keeps the superseded key in the keyring apt reads
+  # and fails every later apt update with NO_PUBKEY FC9CA96ACA026560 -- which
+  # takes fave_packages, and therefore vm-rocjitsu.yml, down with it.
+  #
+  # Move this back to the Galaxy release once the fix lands upstream. The
+  # branch is otherwise plain upstream main at 2.4.0.
+  - name: https://github.com/john00003/batesste-ansible.git
+    type: git
+    version: users/john00003/fave-packages-hashicorp-key-rotation
   - name: sbates130272.rocm_ernic
     version: ">=0.1.0"
