@@ -106,6 +106,29 @@
         mode: '0644'
       become: true
 
+    # Without this the blacklist silently does nothing on the first boot. The
+    # initramfs is generated during cloud-init, before this play runs, so its
+    # copy of /etc/modprobe.d has no blacklist in it and udev autoloads amdgpu
+    # from the initramfs at ~4 s. At that point /lib/firmware is not the guest
+    # root yet, so every firmware request fails with -2 and the probe dies:
+    #
+    #   amdgpu: Direct firmware load for amdgpu/psp_15_0_8_toc_1.bin failed with error -2
+    #   amdgpu: Fatal error during GPU init
+    #
+    # which is doubly confusing because those files *are* present in the booted
+    # guest. Worse, the wedged module cannot be recovered: rmmod segfaults and
+    # a reload reports "Device or resource busy", so it costs a full reboot.
+    #
+    # Unconditional on purpose. Gating this on the blacklist task reporting
+    # "changed" looks tidier but leaves an image whose /etc/modprobe.d is
+    # already right and whose initramfs is still stale -- which is exactly the
+    # broken state this fixes -- untouched on a re-run.
+    - name: Rebuild initramfs so the amdgpu blacklist takes effect on first boot
+      ansible.builtin.command:
+        cmd: update-initramfs -u
+      become: true
+      changed_when: true
+
     - name: Create local temp dir for firmware generation
       ansible.builtin.tempfile:
         state: directory
@@ -187,10 +210,25 @@
     #
     # This requires a QEMU built with the pcie-root-port AtomicOp patch.
 
-    - name: Install rocBLAS dev package
+    # amdrocm-blas-dev alone gives you rocblas.h and no librocblas.so, so
+    # anything that #includes rocBLAS compiles and then fails to link:
+    #   ld.lld: error: unable to find library -lrocblas
+    # The runtime library and the gfx1250 kernel bundle are separate packages.
+    #
+    # Note for anyone running a rocBLAS workload against the emulated part:
+    # export ROCBLAS_USE_HIPBLASLT=0. rocBLAS 10.0 dispatches GEMM through
+    # hipBLASLt, which allocates a 128 MB workspace at handle creation, and the
+    # emulated device exposes 256 MB of which ~94 MB is free after the driver
+    # takes its share. The failure is reported as
+    #   Hip error: 'out of memory'(2) at .../hipblaslt.cpp:164
+    # with nothing naming the workspace. The variable selects rocBLAS's own
+    # Tensile path and the same binary passes.
+    - name: Install rocBLAS (headers, host runtime and gfx1250 kernels)
       ansible.builtin.package:
         name:
           - amdrocm-blas-dev
+          - amdrocm-blas-host10.0
+          - amdrocm-blas10.0-gfx1250
         state: present
         update_cache: false
       become: true
