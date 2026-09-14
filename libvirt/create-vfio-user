@@ -60,6 +60,20 @@
 #     libvirtd. Check `dmesg | grep -i apparmor` when in doubt; the same
 #     class of trap create-nvme documents for image files.
 #
+# [3b] AppArmor will also block the *emulator*, before it ever reaches the
+#     socket. /etc/apparmor.d/usr.sbin.libvirtd permits libvirtd to exec
+#     only /bin/*, /sbin/*, /usr/bin/* and /usr/sbin/*. Since trap [6]
+#     means you are running a patched QEMU, and a patched QEMU usually
+#     lives in a build tree, <emulator> will fail with
+#       cannot execute binary /path/to/qemu-system-x86_64: Permission denied
+#     which reads like a file-mode problem and is not one. `ls -l` the
+#     binary and run it by hand: it works. Install it into /usr/bin (and
+#     give it its firmware -- QEMU looks in <bindir>/../share/qemu, so a
+#     bare copy fails later with "could not load PC BIOS 'bios-256k.bin'").
+#     Note the profile attaches by path, so this bites inside a container
+#     too: `docker run --security-opt apparmor=unconfined` does not exempt
+#     a /usr/sbin/libvirtd the container then execs.
+#
 # [4] PCIe slot collisions with libvirt's own address allocator. libvirt
 #     assigns addresses to the devices it knows about, knows nothing about
 #     anything in <qemu:commandline>, and will happily hand out a slot this
@@ -67,7 +81,12 @@
 #       PCI: slot N function 0 not available for X, in use by Y
 #     START_ADDR exists to move our devices out of the way; raise it until
 #     the collision stops. This is the same workaround, for the same
-#     reason, as create-nvme's START_ADDR.
+#     reason, as create-nvme's START_ADDR. The same applies to any OTHER
+#     device you add by hand in <qemu:commandline> -- give it an explicit
+#     addr as well, or it will take the slot libvirt wanted. Note QEMU
+#     parses addr as hex, so write addr=0x14, not addr=20; the decimal
+#     spelling is rejected with
+#       Property 'virtio-net-pci.addr' doesn't take value '20'
 #
 # [5] The root port is not optional if the guest needs PCIe atomics.
 #     A vfio-user function placed directly on pcie.0 enumerates as a Root
@@ -89,6 +108,18 @@
 #     If you are on a stock QEMU and do not need atomics, set
 #     ATOMIC_OPS=no. Keep ROOT_PORT=yes regardless; it costs nothing and
 #     is closer to how real hardware presents.
+#
+# [7] If the backend runs in a container, the socket is root-owned 0755 and
+#     an unprivileged QEMU cannot connect to it. connect(2) on a unix socket
+#     needs WRITE permission, which 0755 does not give to others, so the
+#     domain fails with "Failed to connect to '...': Permission denied" on a
+#     socket that `ls` shows as perfectly readable. Either run the backend as
+#     the same uid as QEMU, or relax the mode on the socket after the
+#     backend creates it:
+#       docker exec <backend> chmod 0666 /run/vfu/<name>.sock
+#     Also note the backend must already be running: libvirt does not start
+#     it, and a stale socket file left behind by a previous backend gives
+#     "Connection refused" rather than anything that says "stale".
 #
 # --- Variables ------------------------------------------------------------
 #
@@ -176,3 +207,10 @@ for sock in "${SOCKET_LIST[@]}"; do
 done
 echo "# A denial shows up as a connection failure, not as a permission"
 echo "# error; check 'dmesg | grep -i apparmor' if the domain will not start."
+if [ "${ATOMIC_OPS}" = "yes" ]; then
+    echo "#"
+    echo "# The same profile also restricts which emulators libvirt may exec."
+    echo "# x-atomic-ops needs a patched QEMU, and a patched QEMU built in a"
+    echo "# developer tree will fail with 'cannot execute binary ...:"
+    echo "# Permission denied'. Install it under /usr/bin. See trap [3b]."
+fi
