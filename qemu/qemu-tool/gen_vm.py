@@ -482,6 +482,12 @@ def _run_ansible(cfg: VMConfig, images: Path, backing: Path) -> None:
                   "-e", f"username={cfg.username}",
                   "-e", f"vm_username={cfg.username}",
                   "-e", f"vm_root_user={cfg.username}"]
+        # Same reasoning as in _wait_for_ssh: Ansible needs to be told which
+        # identity to use, or it falls back to the caller's default and fails
+        # every task with a publickey denial.
+        ansible_priv = _private_key_for(cfg)
+        if ansible_priv:
+            ap_cmd += ["--private-key", str(ansible_priv)]
         if extra_args:
             ap_cmd += extra_args.split()
 
@@ -516,10 +522,36 @@ def _run_ansible(cfg: VMConfig, images: Path, backing: Path) -> None:
         raise
 
 
+def _private_key_for(cfg: VMConfig) -> Path | None:
+    """The private half of --ssh-key-file, if it is sitting next to it.
+
+    --ssh-key-file names the *public* key that cloud-init injects, and nothing
+    ever tells ssh about the matching private key. When the caller's default
+    identity happens to be the same key that is fine; when it is not -- a CI
+    container, or anyone who keeps this key outside ~/.ssh -- every probe is
+    refused and the run dies 600 seconds later with
+
+        Error: VM did not accept SSH in time.
+
+    which blames the VM for a key problem on this side. ssh-keygen always
+    writes the pair as <name> and <name>.pub, so strip the suffix and use it
+    if it is there; say nothing and behave as before if it is not.
+    """
+    pub = Path(cfg.ssh_key_file).expanduser()
+    if pub.suffix != ".pub":
+        return None
+    priv = pub.with_suffix("")
+    return priv if priv.exists() else None
+
+
 def _wait_for_ssh(
     cfg: VMConfig, timeout: int, host: str = "localhost", port: int | None = None
 ) -> bool:
     p = port if port is not None else cfg.ssh_port
+    priv = _private_key_for(cfg)
+    key_args = ["-i", str(priv), "-o", "IdentitiesOnly=yes"] if priv else []
+    if priv:
+        print(f"Using SSH identity {priv}")
     print(f"Waiting for VM to accept SSH at {host}:{p}...")
     elapsed = 0
     while elapsed < timeout:
@@ -530,6 +562,7 @@ def _wait_for_ssh(
                  "-o", "ConnectTimeout=1",
                  "-o", "StrictHostKeyChecking=no",
                  "-o", "UserKnownHostsFile=/dev/null",
+                 *key_args,
                  "-p", str(p),
                  f"{cfg.username}@{host}", "true"],
                 capture_output=True,
